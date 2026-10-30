@@ -46,6 +46,7 @@ liste de l'AMF avant d'y déposer de l'argent : https://www.amf-france.org (rubr
 | `risk.py` | Taille de position, stop-loss à 2×ATR, stop suiveur, objectif à 3× le risque, coupe-circuit. |
 | `backtest.py` | Simulation sur l'historique, sans biais d'anticipation, avec frais et glissement. Compare le résultat au simple « acheter et garder ». |
 | `broker.py` | `PaperBroker` (vraies données de marché, argent fictif) et `LiveBroker` (ordres réels). |
+| `telegram.py` | Notifications et commandes depuis votre téléphone. |
 | `live.py` | Boucle continue : analyse à chaque nouvelle bougie, surveillance des stops, état sauvegardé dans un fichier JSON (redémarrage sans perte). |
 
 La stratégie est **uniquement acheteuse** (pas de vente à découvert ni d'effet de levier), ce qui fonctionne sur
@@ -105,6 +106,89 @@ python -m tradebot run --live --capital 200 --i-accept-the-risk
 
 Les stops sont surveillés par le bot : il doit **rester allumé** (sur un serveur ou un VPS par exemple) tant
 qu'une position est ouverte.
+
+## Sur votre téléphone (Telegram) et 24 h/24 (serveur)
+
+Le bot doit rester allumé en permanence pour surveiller ses stops. Un téléphone ne le permet pas de façon
+fiable, donc le bot tourne sur un **petit serveur en ligne**, et vous le **pilotez depuis votre téléphone avec Telegram**.
+
+### Ce que vous recevez sur le téléphone
+
+- 🛒 chaque achat (prix, montant, stop-loss, raison) ;
+- 🟢/🔴 chaque vente avec son résultat en euros ;
+- ⛔ le déclenchement du coupe-circuit ;
+- ⚠️ les problèmes de connexion qui durent.
+
+### Commandes
+
+| Commande | Effet |
+|---|---|
+| `/statut` | capital, gain ou perte, position ouverte, dernière analyse |
+| `/pause` | plus aucun nouvel achat (une position ouverte reste protégée par son stop) |
+| `/reprendre` | réautorise les achats |
+| `/vendre oui` | vend tout immédiatement et met le bot en pause |
+| `/aide` | liste des commandes |
+
+Seul **votre** compte Telegram est obéi : les messages de toute autre personne sont ignorés.
+Et même si quelqu'un prenait votre téléphone, il ne pourrait que vendre ou mettre en pause, **jamais retirer votre argent**.
+
+### Étape 1 : créer votre bot Telegram (5 minutes, sur le téléphone)
+
+1. Installez Telegram, cherchez **@BotFather** (badge bleu officiel) et envoyez `/newbot`.
+2. Choisissez un nom, puis un identifiant qui finit par `bot` (ex. `fares_trading_bot`).
+3. BotFather vous donne un **token** du type `123456:ABC-...`. Gardez-le secret.
+4. Ouvrez votre nouveau bot et envoyez-lui « bonjour ».
+
+### Étape 2 : louer un serveur (environ 4 à 6 €/mois)
+
+Un VPS Linux **Ubuntu 24.04** avec 1 Go de RAM suffit, par exemple chez OVHcloud (français) ou Hetzner.
+Avantage sécurité : le serveur a une **adresse IP fixe**, vous pourrez donc limiter votre clé API Kraken à cette seule adresse.
+
+### Étape 3 : installer le bot sur le serveur
+
+Connectez-vous au serveur (depuis un ordinateur : `ssh root@ADRESSE_IP` ; depuis le téléphone : application
+*Termius*), puis :
+
+```bash
+git clone https://github.com/faresfettah/Fares.git && cd Fares && git checkout claude/zealous-keller-jw9d29
+```
+
+```bash
+sudo bash deploy/install.sh
+```
+
+```bash
+nano /opt/tradebot/.env
+```
+
+Dans ce fichier, collez `TELEGRAM_BOT_TOKEN=...`, enregistrez (Ctrl+O, Entrée, Ctrl+X), puis récupérez votre identifiant de chat :
+
+```bash
+cd /opt/tradebot && sudo -u tradebot .venv/bin/python -m tradebot telegram-setup
+```
+
+Recopiez la ligne `TELEGRAM_CHAT_ID=...` affichée dans `/opt/tradebot/.env`, puis démarrez :
+
+```bash
+systemctl restart tradebot
+```
+
+Vous recevez « ▶️ Bot démarré » sur Telegram. Par défaut c'est du **paper trading** (`TRADEBOT_ARGS=--capital 1000`).
+Le bot redémarre tout seul si le serveur redémarre ou en cas de plantage.
+
+Pour passer en réel plus tard (après plusieurs semaines de paper trading), ajoutez vos clés Kraken dans `.env` et remplacez la ligne par :
+
+```
+TRADEBOT_ARGS=--live --capital 200 --i-accept-the-risk --yes
+```
+
+`--yes` est nécessaire sur un serveur, car personne ne peut y taper `OUI`.
+
+Voir l'activité du bot :
+
+```bash
+journalctl -u tradebot -f
+```
 
 ## Options utiles
 

@@ -10,6 +10,7 @@ Par défaut : Kraken, BTC/EUR, bougies de 4h, réglages prudents.
 """
 import argparse
 import logging
+import os
 import sys
 
 from .backtest import run_backtest
@@ -63,11 +64,6 @@ def cmd_run(args):
     if args.live:
         if not args.i_accept_the_risk:
             sys.exit("Mode réel refusé : ajoutez --i-accept-the-risk après avoir testé en paper trading.")
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-        except ImportError:
-            pass
         ex = make_exchange(args.exchange, with_keys=True, sandbox=args.sandbox)
         broker = LiveBroker(ex, cfg.symbol)
         quote, _ = broker.balances()
@@ -87,7 +83,31 @@ def cmd_run(args):
         broker = PaperBroker(make_exchange(args.exchange), cfg.symbol, cash=args.capital,
                              fee_rate=cfg.risk.fee_rate, slippage=cfg.risk.slippage)
         state = args.state or "state_paper.json"
-    LiveTrader(broker, cfg, budget=args.capital, state_path=state).run(poll_seconds=args.poll)
+    tg = _telegram()
+    trader = LiveTrader(broker, cfg, budget=args.capital, state_path=state, notify=tg.send if tg else None)
+    if tg:
+        from .telegram import start_listener
+        start_listener(tg, trader)
+        logging.getLogger("tradebot").info("Telegram connecté : pilotage depuis le téléphone actif")
+    trader.run(poll_seconds=args.poll)
+
+
+def _telegram():
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not token:
+        return None
+    if not chat:
+        sys.exit("TELEGRAM_CHAT_ID manquant : lancez  python -m tradebot telegram-setup")
+    from .telegram import Telegram
+    return Telegram(token, chat)
+
+
+def cmd_telegram_setup(args):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        sys.exit("Mettez d'abord TELEGRAM_BOT_TOKEN dans le fichier .env (donné par @BotFather).")
+    from .telegram import discover_chat_id
+    discover_chat_id(token)
 
 
 def main(argv=None):
@@ -127,7 +147,15 @@ def main(argv=None):
     r.add_argument("--state", help="fichier d'état")
     r.set_defaults(func=cmd_run)
 
+    t = sub.add_parser("telegram-setup", help="trouver votre TELEGRAM_CHAT_ID")
+    t.set_defaults(func=cmd_telegram_setup)
+
     args = p.parse_args(argv)
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args.func(args)
 

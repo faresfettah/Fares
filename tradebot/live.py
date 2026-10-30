@@ -6,9 +6,9 @@ le bot doit donc rester allumé tant qu'une position est ouverte.
 import json
 import logging
 import os
-import time
+import threading
 from dataclasses import asdict
-from typing import Optional
+from typing import Callable, Optional
 
 from .broker import Broker
 from .config import BotConfig
@@ -19,7 +19,8 @@ log = logging.getLogger("tradebot")
 
 
 class LiveTrader:
-    def __init__(self, broker: Broker, cfg: BotConfig, budget: float, state_path: str = "state.json"):
+    def __init__(self, broker: Broker, cfg: BotConfig, budget: float, state_path: str = "state.json",
+                 notify: Optional[Callable[[str], None]] = None):
         """`budget` : somme maximale confiée au bot. Il n'utilisera jamais plus, même si le
         compte contient davantage, et le coupe-circuit se calcule sur ce budget."""
         self.broker, self.cfg, self.state_path = broker, cfg, state_path
@@ -28,6 +29,13 @@ class LiveTrader:
         self.position: Optional[Position] = None
         self.last_candle: Optional[str] = None
         self.guard = DrawdownGuard(cfg.risk.max_drawdown, peak=budget)
+        self.notify = notify or (lambda msg: None)
+        self.paused = False            # pause : plus de nouvel achat, la position reste protégée
+        self.last_price: Optional[float] = None
+        self.last_analysis = ""
+        self._close_requested = False
+        self._lock = threading.RLock()  # les commandes Telegram arrivent depuis un autre thread
+        self._wake = threading.Event()
         self._load()
 
     # --- persistance : le bot peut redémarrer sans perdre sa position ---
@@ -40,6 +48,7 @@ class LiveTrader:
             self.position = Position(**s["position"])
         self.last_candle = s.get("last_candle")
         self.realized_pnl = s.get("realized_pnl", 0.0)
+        self.paused = s.get("paused", False)
         self.guard.peak = s.get("peak", 0.0)
         self.guard.tripped = s.get("tripped", False)
         if "paper" in s and hasattr(self.broker, "cash"):
@@ -50,6 +59,7 @@ class LiveTrader:
             "position": asdict(self.position) if self.position else None,
             "last_candle": self.last_candle,
             "realized_pnl": self.realized_pnl,
+            "paused": self.paused,
             "peak": self.guard.peak,
             "tripped": self.guard.tripped,
         }
@@ -70,9 +80,57 @@ class LiveTrader:
         self.realized_pnl += pnl
         log.info("VENTE %.6f @ %.4f (%s) | PnL estimé %+.2f %s",
                  self.position.qty, fill, reason, pnl, self.broker.quote)
+        self.notify(f"{'🟢' if pnl > 0 else '🔴'} VENTE {self.cfg.symbol} ({reason})\n"
+                    f"{self.position.qty:.6f} @ {fill:.2f}\n"
+                    f"Résultat : {pnl:+.2f} {self.broker.quote}\n"
+                    f"Capital du bot : {self.budget + self.realized_pnl:.2f} {self.broker.quote}")
         self.position = None
 
+    # --- commandes à distance (Telegram) ---
+    def pause(self):
+        with self._lock:
+            self.paused = True
+            self._save()
+
+    def resume(self):
+        with self._lock:
+            self.paused = False
+            self._save()
+
+    def request_close(self):
+        """Vente de la position au prochain cycle (déclenché immédiatement), puis mise en pause."""
+        self._close_requested = True
+        self._wake.set()
+
+    def status(self) -> str:
+        with self._lock:
+            q = self.broker.quote
+            lines = [f"📊 {self.cfg.symbol} ({self.cfg.timeframe}) - {type(self.broker).__name__}"]
+            if self.last_price is not None:
+                eq = self.bot_equity(self.last_price)
+                lines += [f"Prix : {self.last_price:.2f} {q}",
+                          f"Capital du bot : {eq:.2f} {q} ({eq / self.budget - 1:+.2%} sur le budget de {self.budget:.2f})"]
+            if self.position:
+                p = self.position
+                pnl = p.qty * (self.last_price or p.entry_price) - p.cost
+                lines += [f"Position : {p.qty:.6f} achetée à {p.entry_price:.2f}",
+                          f"  latent {pnl:+.2f} {q} | stop {p.stop:.2f}"
+                          + (f" | objectif {p.take_profit:.2f}" if p.take_profit else "")]
+            else:
+                lines.append("Position : aucune")
+            if self.guard.tripped:
+                lines.append("⛔ Coupe-circuit déclenché : bot arrêté")
+            elif self.paused:
+                lines.append("⏸ En pause (aucun nouvel achat)")
+            if self.last_analysis:
+                lines.append(f"Dernière analyse : {self.last_analysis}")
+            return "\n".join(lines)
+
     def step(self):
+        with self._lock:
+            self._step()
+
+    def _step(self):
         r = self.cfg.risk
         df = self.broker.candles(self.cfg.timeframe, limit=max(300, self.cfg.strategy.slow_ema * 4))
         closed = df.iloc[:-1]  # la dernière bougie est encore en cours : on l'ignore
@@ -81,6 +139,16 @@ class LiveTrader:
         candle_id = str(data.index[-1])
         new_candle = candle_id != self.last_candle
         price = self.broker.price()
+        self.last_price = price
+
+        if self._close_requested:
+            self._close_requested = False
+            self.paused = True  # sinon le bot pourrait racheter aussitôt sur le même signal
+            if self.position is not None:
+                self._exit("demande manuelle")
+                self.notify("⏸ Bot mis en pause. Envoyez /reprendre pour réautoriser les achats.")
+            else:
+                self.notify("Aucune position à vendre.")
 
         # 1) Gestion de la position ouverte (à chaque passage)
         if self.position is not None:
@@ -94,16 +162,21 @@ class LiveTrader:
 
         # 2) Coupe-circuit, calculé sur le capital du bot uniquement
         equity = self.bot_equity(price)
+        was_tripped = self.guard.tripped
         if self.guard.update(equity):
             if self.position is not None:
                 self._exit("coupe-circuit")
+            if not was_tripped:
+                self.notify(f"⛔ COUPE-CIRCUIT : le bot a perdu {100 * r.max_drawdown:.0f} % de son capital. "
+                            "Tout est vendu et le bot ne prendra plus de position.")
             log.warning("COUPE-CIRCUIT actif (redémarrage manuel requis : supprimez le fichier d'état)"
                         " : drawdown >= %.0f %%. Aucune nouvelle position.", 100 * r.max_drawdown)
 
         # 3) Nouvelle entrée, uniquement sur une bougie nouvellement clôturée
         if new_candle:
-            log.info("%s %s", candle_id, explain(last))
-            if self.position is None and last["signal"] == BUY and not self.guard.tripped:
+            self.last_analysis = explain(last)
+            log.info("%s %s", candle_id, self.last_analysis)
+            if self.position is None and last["signal"] == BUY and not self.guard.tripped and not self.paused:
                 quote, _ = self.broker.balances()
                 qty = position_size(min(equity, quote), price * (1 + r.slippage), float(last["atr"]), r)
                 qty = self.broker.round_amount(qty)
@@ -113,6 +186,9 @@ class LiveTrader:
                     log.info("ACHAT %.6f @ %.4f | stop %.4f | objectif %s",
                              qty, fill, self.position.stop,
                              f"{self.position.take_profit:.4f}" if self.position.take_profit else "-")
+                    self.notify(f"🛒 ACHAT {self.cfg.symbol}\n{qty:.6f} @ {fill:.2f} "
+                                f"(≈ {self.position.cost:.2f} {self.broker.quote})\n"
+                                f"Stop-loss : {self.position.stop:.2f}\n{self.last_analysis}")
                 else:
                     log.info("Signal d'achat ignoré : quantité trop faible (%.8f)", qty)
             self.last_candle = candle_id
@@ -123,11 +199,19 @@ class LiveTrader:
     def run(self, poll_seconds: int = 60):
         log.info("Démarrage %s %s (%s) - Ctrl+C pour arrêter",
                  type(self.broker).__name__, self.cfg.symbol, self.cfg.timeframe)
+        self.notify(f"▶️ Bot démarré : {self.cfg.symbol} ({self.cfg.timeframe}), "
+                    f"{type(self.broker).__name__}, budget {self.budget:.2f} {self.broker.quote}. Tapez /aide.")
+        errors = 0
         while True:
             try:
                 self.step()
+                errors = 0
             except KeyboardInterrupt:
                 raise
-            except Exception:  # réseau, API... on log et on réessaie au prochain cycle
+            except Exception as e:  # réseau, API... on log et on réessaie au prochain cycle
+                errors += 1
                 log.exception("Erreur pendant le cycle, nouvelle tentative au prochain passage")
-            time.sleep(poll_seconds)
+                if errors in (3, 30) or errors % 300 == 0:  # pas de spam pour une coupure passagère
+                    self.notify(f"⚠️ {errors} erreurs de suite (dernière : {e}). Le bot réessaie.")
+            self._wake.wait(poll_seconds)
+            self._wake.clear()

@@ -1,0 +1,17 @@
+# Service systemd : le bot démarre avec le serveur et redémarre tout seul en cas de plantage.
+# Installé automatiquement par deploy/install.sh
+[Unit]
+Description=TradeBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=tradebot
+WorkingDirectory=/opt/tradebot
+EnvironmentFile=/opt/tradebot/.env
+ExecStart=/opt/tradebot/.venv/bin/python -m tradebot run $TRADEBOT_ARGS
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
