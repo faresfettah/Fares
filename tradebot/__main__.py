@@ -1,10 +1,12 @@
 """Interface en ligne de commande.
 
   python -m tradebot backtest --synthetic
-  python -m tradebot backtest --exchange binance --symbol BTC/USDT --timeframe 4h --limit 3000
-  python -m tradebot analyze  --exchange binance --symbol ETH/USDT
-  python -m tradebot run      --exchange binance --symbol BTC/USDT --capital 1000          # paper
-  python -m tradebot run      --exchange binance --symbol BTC/USDT --live --i-accept-the-risk
+  python -m tradebot backtest --limit 3000
+  python -m tradebot analyze  --symbol ETH/EUR
+  python -m tradebot run      --capital 1000                                   # paper (argent fictif)
+  python -m tradebot run      --live --capital 200 --i-accept-the-risk         # réel, budget plafonné
+
+Par défaut : Kraken, BTC/EUR, bougies de 4h, réglages prudents.
 """
 import argparse
 import logging
@@ -68,12 +70,24 @@ def cmd_run(args):
             pass
         ex = make_exchange(args.exchange, with_keys=True, sandbox=args.sandbox)
         broker = LiveBroker(ex, cfg.symbol)
+        quote, _ = broker.balances()
+        if args.capital > quote:
+            sys.exit(f"Budget ({args.capital} {broker.quote}) supérieur au solde disponible ({quote:.2f}).")
+        print(f"\n*** MODE RÉEL sur {args.exchange} ***\n"
+              f"  Paire              : {cfg.symbol} ({cfg.timeframe})\n"
+              f"  Budget du bot      : {args.capital:.2f} {broker.quote} (solde du compte : {quote:.2f})\n"
+              f"  Risque par trade   : {100 * cfg.risk.risk_per_trade:.1f} % "
+              f"(~{args.capital * cfg.risk.risk_per_trade:.2f} {broker.quote})\n"
+              f"  Coupe-circuit      : arrêt si perte de {100 * cfg.risk.max_drawdown:.0f} % "
+              f"(~{args.capital * cfg.risk.max_drawdown:.2f} {broker.quote})\n")
+        if not args.yes and input("Tapez OUI pour démarrer : ").strip() != "OUI":
+            sys.exit("Annulé.")
         state = args.state or "state_live.json"
     else:
         broker = PaperBroker(make_exchange(args.exchange), cfg.symbol, cash=args.capital,
                              fee_rate=cfg.risk.fee_rate, slippage=cfg.risk.slippage)
         state = args.state or "state_paper.json"
-    LiveTrader(broker, cfg, state_path=state).run(poll_seconds=args.poll)
+    LiveTrader(broker, cfg, budget=args.capital, state_path=state).run(poll_seconds=args.poll)
 
 
 def main(argv=None):
@@ -81,13 +95,15 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("--exchange", default="binance", help="nom ccxt : binance, kraken, coinbase, bybit, okx...")
-        sp.add_argument("--symbol", default="BTC/USDT")
-        sp.add_argument("--timeframe", default="1h")
-        sp.add_argument("--capital", type=float, default=10_000.0)
-        sp.add_argument("--risk", type=float, default=0.01, help="part du capital risquée par trade")
-        sp.add_argument("--max-drawdown", type=float, default=0.20)
-        sp.add_argument("--fee", type=float, default=0.001)
+        d = BotConfig()
+        sp.add_argument("--exchange", default="kraken", help="nom ccxt : kraken, coinbase, bitstamp, binance...")
+        sp.add_argument("--symbol", default=d.symbol)
+        sp.add_argument("--timeframe", default=d.timeframe)
+        sp.add_argument("--capital", type=float, default=1_000.0,
+                        help="capital simulé (paper) ou budget MAXIMAL confié au bot (réel)")
+        sp.add_argument("--risk", type=float, default=d.risk.risk_per_trade, help="part du capital risquée par trade")
+        sp.add_argument("--max-drawdown", type=float, default=d.risk.max_drawdown)
+        sp.add_argument("--fee", type=float, default=d.risk.fee_rate)
 
     b = sub.add_parser("backtest", help="tester la stratégie sur l'historique")
     common(b)
@@ -105,7 +121,8 @@ def main(argv=None):
     common(r)
     r.add_argument("--live", action="store_true", help="ordres RÉELS")
     r.add_argument("--i-accept-the-risk", action="store_true")
-    r.add_argument("--sandbox", action="store_true", help="utiliser le testnet de la plateforme")
+    r.add_argument("--sandbox", action="store_true", help="testnet (si la plateforme en propose un ; pas Kraken spot)")
+    r.add_argument("--yes", action="store_true", help="ne pas demander de confirmation (serveur)")
     r.add_argument("--poll", type=int, default=60, help="secondes entre deux vérifications")
     r.add_argument("--state", help="fichier d'état")
     r.set_defaults(func=cmd_run)

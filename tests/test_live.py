@@ -14,7 +14,7 @@ class FakeExchange:
         self.df, self.i = df, 300
 
     def market(self, symbol):
-        return {"base": "BTC", "quote": "USDT", "limits": {"amount": {"min": 0.0}}}
+        return {"base": "BTC", "quote": "EUR", "limits": {"amount": {"min": 0.0}}}
 
     def parse_timeframe(self, tf):
         return 3600
@@ -38,7 +38,7 @@ def test_paper_trader_trades_and_persists(tmp_path):
     ex = FakeExchange(synthetic(1500))
     broker = PaperBroker(ex, "BTC/USDT", cash=10_000)
     state = tmp_path / "state.json"
-    trader = LiveTrader(broker, BotConfig(), state_path=str(state))
+    trader = LiveTrader(broker, BotConfig(), budget=10_000, state_path=str(state))
     entries = 0
     for _ in range(1000):
         had = trader.position is not None
@@ -51,6 +51,26 @@ def test_paper_trader_trades_and_persists(tmp_path):
     assert saved["paper"] == [broker.cash, broker.base_qty]
 
     # Redémarrage : l'état (position, soldes) est restauré
-    restored = LiveTrader(PaperBroker(ex, "BTC/USDT", cash=0), BotConfig(), state_path=str(state))
+    restored = LiveTrader(PaperBroker(ex, "BTC/USDT", cash=0), BotConfig(), budget=10_000, state_path=str(state))
     assert (restored.position is None) == (trader.position is None)
     assert restored.broker.cash == broker.cash
+    assert restored.realized_pnl == trader.realized_pnl
+
+
+def test_bot_never_uses_more_than_its_budget(tmp_path):
+    """Compte avec 100 000 € mais budget de 1 000 € : aucune position ne dépasse le budget."""
+    ex = FakeExchange(synthetic(1500))
+    broker = PaperBroker(ex, "BTC/USDT", cash=100_000)
+    trader = LiveTrader(broker, BotConfig(), budget=1_000, state_path=str(tmp_path / "s.json"))
+    r = BotConfig().risk
+    entries = 0
+    for _ in range(1000):
+        had = trader.position is not None
+        capital = trader.budget + trader.realized_pnl
+        trader.step()
+        if not had and trader.position is not None:
+            entries += 1
+            assert trader.position.cost <= capital * r.max_position_pct * (1 + r.fee_rate + r.slippage) + 1e-9
+        ex.i += 1
+    assert entries > 0
+    assert broker.cash > 100_000 - 1_000  # le reste du compte n'est jamais touché

@@ -19,11 +19,15 @@ log = logging.getLogger("tradebot")
 
 
 class LiveTrader:
-    def __init__(self, broker: Broker, cfg: BotConfig, state_path: str = "state.json"):
+    def __init__(self, broker: Broker, cfg: BotConfig, budget: float, state_path: str = "state.json"):
+        """`budget` : somme maximale confiée au bot. Il n'utilisera jamais plus, même si le
+        compte contient davantage, et le coupe-circuit se calcule sur ce budget."""
         self.broker, self.cfg, self.state_path = broker, cfg, state_path
+        self.budget = budget
+        self.realized_pnl = 0.0
         self.position: Optional[Position] = None
         self.last_candle: Optional[str] = None
-        self.guard = DrawdownGuard(cfg.risk.max_drawdown)
+        self.guard = DrawdownGuard(cfg.risk.max_drawdown, peak=budget)
         self._load()
 
     # --- persistance : le bot peut redémarrer sans perdre sa position ---
@@ -35,6 +39,7 @@ class LiveTrader:
         if s.get("position"):
             self.position = Position(**s["position"])
         self.last_candle = s.get("last_candle")
+        self.realized_pnl = s.get("realized_pnl", 0.0)
         self.guard.peak = s.get("peak", 0.0)
         self.guard.tripped = s.get("tripped", False)
         if "paper" in s and hasattr(self.broker, "cash"):
@@ -44,6 +49,7 @@ class LiveTrader:
         s = {
             "position": asdict(self.position) if self.position else None,
             "last_candle": self.last_candle,
+            "realized_pnl": self.realized_pnl,
             "peak": self.guard.peak,
             "tripped": self.guard.tripped,
         }
@@ -54,9 +60,14 @@ class LiveTrader:
             json.dump(s, f, indent=2)
         os.replace(tmp, self.state_path)
 
+    def bot_equity(self, price: float) -> float:
+        unrealized = self.position.qty * price - self.position.cost if self.position else 0.0
+        return self.budget + self.realized_pnl + unrealized
+
     def _exit(self, reason: str):
         fill = self.broker.sell(self.position.qty)
         pnl = self.position.qty * fill * (1 - self.cfg.risk.fee_rate) - self.position.cost
+        self.realized_pnl += pnl
         log.info("VENTE %.6f @ %.4f (%s) | PnL estimé %+.2f %s",
                  self.position.qty, fill, reason, pnl, self.broker.quote)
         self.position = None
@@ -81,13 +92,13 @@ class LiveTrader:
             elif new_candle and last["signal"] == SELL:
                 self._exit("signal")
 
-        # 2) Coupe-circuit
-        equity = self.broker.equity(price)
+        # 2) Coupe-circuit, calculé sur le capital du bot uniquement
+        equity = self.bot_equity(price)
         if self.guard.update(equity):
             if self.position is not None:
                 self._exit("coupe-circuit")
-            log.warning("COUPE-CIRCUIT actif : drawdown >= %.0f %%. Aucune nouvelle position.",
-                        100 * r.max_drawdown)
+            log.warning("COUPE-CIRCUIT actif (redémarrage manuel requis : supprimez le fichier d'état)"
+                        " : drawdown >= %.0f %%. Aucune nouvelle position.", 100 * r.max_drawdown)
 
         # 3) Nouvelle entrée, uniquement sur une bougie nouvellement clôturée
         if new_candle:
